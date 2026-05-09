@@ -1,113 +1,136 @@
-using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 
+/// <summary>
+/// Dual-mode input controller: reads keyboard axes for the human player or
+/// runs an autonomous waypoint-following AI for opponent karts.
+///
+/// AI difficulty scales acceleration and look-ahead distance, producing
+/// noticeably different opponent behaviours without separate code paths.
+/// </summary>
 public class InputManager : MonoBehaviour
 {
-    internal enum driver
-    {
-        AI,
-        keyboard
-    }
+    // ── Inspector ─────────────────────────────────────────────────────────────
 
-    [SerializeField] driver driveController;
+    internal enum DriverType { Keyboard, AI }
+
+    [SerializeField] private DriverType driverType = DriverType.Keyboard;
+
+    public enum AIDifficulty { Easy, Medium, Hard }
+    [SerializeField] private AIDifficulty difficulty = AIDifficulty.Medium;
+
+    public TrackWayPoints wayPoints;
+    [Tooltip("How many waypoints ahead the AI targets (higher = smoother, less reactive).")]
+    public int distanceOffset = 3;
+
+    // ── Runtime state (read by PlayerController) ──────────────────────────────
 
     public float vertical;
     public float horizontal;
-    public bool handbrake;
-    public bool boosting;
+    public bool  handbrake;
+    public bool  boosting;
+    public int   currentNode;
 
-    public TrackWayPoints wayPoints;
-    public Transform currentWaypoint;
     public List<Transform> nodes = new List<Transform>();
-    public int distanceOffset = 3;
-    private float steerForce = 1;
-    public float acceleration = 0.5f;
-    public int currentNode;
+    public Transform currentWaypoint;
+
+    // ── Difficulty presets ────────────────────────────────────────────────────
+
+    private static readonly float[] AccelerationByDifficulty = { 0.35f, 0.55f, 0.85f };
+    private static readonly int[]   LookAheadByDifficulty    = { 2,     3,     5     };
+
+    private float _aiAcceleration;
+
+    // ── Unity messages ────────────────────────────────────────────────────────
 
     private void Awake()
     {
-        wayPoints = GameObject.FindGameObjectWithTag("path").GetComponent<TrackWayPoints>();
-        nodes = wayPoints.nodes;
+        GameObject pathObject = GameObject.FindGameObjectWithTag("path");
+        if (pathObject != null)
+        {
+            wayPoints = pathObject.GetComponent<TrackWayPoints>();
+            nodes     = wayPoints.nodes;
+        }
+        else
+        {
+            Debug.LogError("No GameObject tagged 'path' found — AI navigation disabled.");
+        }
+
+        int d          = (int)difficulty;
+        _aiAcceleration = AccelerationByDifficulty[d];
+        distanceOffset  = LookAheadByDifficulty[d];
     }
 
     private void FixedUpdate()
     {
-        if (gameObject.tag == "AI")
-        {
-            AIDrive();
-        }
-        else if (gameObject.tag == "Player")
-        {
-            calculateWaypointDistances();
-            keyboardDrive();
-        }
-    }
+        if (nodes.Count == 0) return;
 
-    // AI-controlled vehicle logic
-    private void AIDrive()
-    {
-        calculateWaypointDistances();
-        AISteer();
-        vertical = acceleration;
-    }
+        UpdateCurrentNode();
 
-    // Keyboard-controlled vehicle logic
-    private void keyboardDrive()
-    {
-        vertical = Input.GetAxis("Vertical");
-        horizontal = Input.GetAxis("Horizontal");
-        handbrake = (Input.GetAxis("Jump") != 0) ? true : false;
-
-        if (Input.GetKey(KeyCode.LeftShift))
-        {
-            boosting = true;
-        }
+        if (gameObject.CompareTag("AI"))
+            DriveAI();
         else
-        {
-            boosting = false;
-        }
+            DriveKeyboard();
     }
 
-    // Calculate distances to waypoints for AI steering
-    private void calculateWaypointDistances()
+    // ── Player input ──────────────────────────────────────────────────────────
+
+    private void DriveKeyboard()
     {
-        Vector3 position = gameObject.transform.position;
-        float distance = Mathf.Infinity;
+        vertical   = Input.GetAxis("Vertical");
+        horizontal = Input.GetAxis("Horizontal");
+        handbrake  = Input.GetAxis("Jump") != 0f;
+        boosting   = Input.GetKey(KeyCode.LeftShift);
+    }
+
+    // ── AI control ────────────────────────────────────────────────────────────
+
+    private void DriveAI()
+    {
+        SteerTowardWaypoint();
+
+        // Ease off throttle when the required steering is large (sharp corner).
+        float steerMagnitude = Mathf.Abs(horizontal);
+        vertical = _aiAcceleration * Mathf.Lerp(1f, 0.4f, steerMagnitude);
+    }
+
+    private void SteerTowardWaypoint()
+    {
+        if (currentWaypoint == null) return;
+
+        // Project target into local space; normalise so only direction matters.
+        Vector3 local = transform.InverseTransformPoint(currentWaypoint.position).normalized;
+        horizontal = local.x;   // [-1, 1] maps directly to steering input
+    }
+
+    /// <summary>
+    /// Scans all waypoints to find the closest one, then targets the node
+    /// <see cref="distanceOffset"/> steps ahead of it.
+    /// </summary>
+    private void UpdateCurrentNode()
+    {
+        float minDist = Mathf.Infinity;
 
         for (int i = 0; i < nodes.Count; i++)
         {
-            Vector3 difference = nodes[i].transform.position - position;
-            float currentDistance = difference.magnitude;
-            if (currentDistance < distance)
+            float dist = (nodes[i].position - transform.position).sqrMagnitude;
+            if (dist < minDist)
             {
-                if ((i + distanceOffset) >= nodes.Count)
-                {
-                    currentWaypoint = nodes[1];
-                    distance = currentDistance;
-                }
-                else
-                {
-                    currentWaypoint = nodes[i + distanceOffset];
-                    distance = currentDistance;
-                }
+                minDist     = dist;
                 currentNode = i;
+
+                int ahead = (i + distanceOffset) % nodes.Count;
+                currentWaypoint = nodes[ahead];
             }
         }
     }
 
-    // AI steering logic
-    private void AISteer()
-    {
-        Vector3 relative = transform.InverseTransformPoint(currentWaypoint.transform.position);
-        relative /= relative.magnitude;
+    // ── Editor gizmo ─────────────────────────────────────────────────────────
 
-        horizontal = (relative.x / relative.magnitude) * steerForce;
-    }
-
-    // Draw a wire sphere to visualize the current waypoint
     private void OnDrawGizmos()
     {
-        Gizmos.DrawWireSphere(currentWaypoint.position, 3);
+        if (currentWaypoint == null) return;
+        Gizmos.color = Color.cyan;
+        Gizmos.DrawWireSphere(currentWaypoint.position, 1.5f);
     }
 }
