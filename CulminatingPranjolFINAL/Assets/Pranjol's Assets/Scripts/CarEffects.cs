@@ -1,45 +1,36 @@
-using System.Collections;
-using System.Collections.Generic;
 using UnityEngine;
 
+/// <summary>
+/// Manages vehicle particle effects. Toggled by <see cref="PlayerController"/>
+/// during nitro activation/deactivation. AI karts share the same component but
+/// are driven via direct method calls rather than input polling.
+/// </summary>
 public class CarEffects : MonoBehaviour
 {
-    private PlayerController controller;
-    private InputManager IM;
+    [SerializeField] private ParticleSystem[] nitrusSmoke;
 
-    public ParticleSystem[] nitrusSmoke;
-    // Start is called before the first frame update
-    void Start()
+    private PlayerController _controller;
+
+    private void Start()
     {
-        if (gameObject.tag == "AI") return;
-        controller = GetComponent<PlayerController>();
-        IM = GetComponent<InputManager>();
+        _controller = GetComponent<PlayerController>();
     }
 
-    // Update is called once per frame
-    void FixedUpdate()
-    {
-        if (gameObject.tag == "AI") return;
-    }
-
+    /// <summary>Begins emitting nitro particles and sets the boost flag.</summary>
     public void startNitrusEmitter()
     {
-        if (controller.nitrusFlag) return;
-        for (int i = 0; i < nitrusSmoke.Length; i++)
-        {
-            nitrusSmoke[i].Play();
-        }
+        if (_controller.nitrusFlag) return;
 
-        controller.nitrusFlag = true;
+        foreach (var ps in nitrusSmoke) ps.Play();
+        _controller.nitrusFlag = true;
     }
+
+    /// <summary>Stops emitting nitro particles and clears the boost flag.</summary>
     public void stopNitrusEmitter()
     {
-        if (!controller.nitrusFlag) return;
-        for (int i = 0; i < nitrusSmoke.Length; i++)
-        {
-            nitrusSmoke[i].Stop();
-        }
-        controller.nitrusFlag = false;
+        if (!_controller.nitrusFlag) return;
 
+        foreach (var ps in nitrusSmoke) ps.Stop();
+        _controller.nitrusFlag = false;
     }
 }

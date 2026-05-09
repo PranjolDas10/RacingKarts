@@ -1,54 +1,56 @@
-using System.Collections;
-using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Serialization;
 
+/// <summary>
+/// Third-person follow camera with speed-reactive smoothing and dynamic FOV
+/// during nitro boost. All camera data flows from the player's
+/// <see cref="PlayerController"/> so this component has no direct UI coupling.
+/// </summary>
 public class CameraController : MonoBehaviour
 {
-    private GameObject Player;
-    private PlayerController RR;
-    private GameObject cameralookAt, cameraPos;
-    private float speed = 0;
-    private float defaltFOV = 0, desiredFOV = 0;
-    [Range(0, 50)] public float smothTime = 8;
+    // FormerlySerializedAs preserves the saved Inspector value after a rename.
+    [FormerlySerializedAs("smothTime")]
+    [Range(0f, 50f)] public float smoothTime = 8f;
+
+    [SerializeField] private float fovLerpSpeed = 5f;
+
+    private PlayerController _player;
+    private Transform        _lookAtTarget;
+    private Transform        _mountPoint;
+    private float            _defaultFov;
+    private float            _boostedFov;
 
     private void Start()
     {
-        // Find and assign the necessary game objects and components
-        Player = GameObject.FindGameObjectWithTag("Player");
-        RR = Player.GetComponent<PlayerController>();
-        cameralookAt = Player.transform.Find("Camera LookAt").gameObject;
-        cameraPos = Player.transform.Find("Camera Constraint").gameObject;
+        GameObject playerGo = GameObject.FindGameObjectWithTag("Player");
+        if (playerGo == null) { Debug.LogError("CameraController: no Player tag found."); return; }
 
-        // Initialize default and desired field of view values
-        defaltFOV = Camera.main.fieldOfView;
-        desiredFOV = defaltFOV + 15;
+        _player      = playerGo.GetComponent<PlayerController>();
+        _lookAtTarget = playerGo.transform.Find("Camera LookAt");
+        _mountPoint   = playerGo.transform.Find("Camera Constraint");
+
+        _defaultFov = Camera.main.fieldOfView;
+        _boostedFov = _defaultFov + 15f;
     }
 
     private void FixedUpdate()
     {
-        // Follow the player and adjust the field of view
-        follow();
-        boostFOV();
+        Follow();
+        UpdateFov();
     }
 
-    // Follow the player's movement
-    private void follow()
+    private void Follow()
     {
-        speed = RR.KPH / smothTime;
-        gameObject.transform.position = Vector3.Lerp(transform.position, cameraPos.transform.position, Time.deltaTime * speed);
-        gameObject.transform.LookAt(cameralookAt.gameObject.transform.position);
+        if (_mountPoint == null || _lookAtTarget == null) return;
+
+        float speed = _player.KPH / smoothTime;
+        transform.position = Vector3.Lerp(transform.position, _mountPoint.position, Time.deltaTime * speed);
+        transform.LookAt(_lookAtTarget);
     }
 
-    // Adjust the field of view based on nitrus usage
-    private void boostFOV()
+    private void UpdateFov()
     {
-        if (RR.nitrusFlag)
-        {
-            Camera.main.fieldOfView = Mathf.Lerp(Camera.main.fieldOfView, desiredFOV, Time.deltaTime * 5);
-        }
-        else
-        {
-            Camera.main.fieldOfView = Mathf.Lerp(Camera.main.fieldOfView, defaltFOV, Time.deltaTime * 5);
-        }
+        float targetFov = _player.nitrusFlag ? _boostedFov : _defaultFov;
+        Camera.main.fieldOfView = Mathf.Lerp(Camera.main.fieldOfView, targetFov, Time.deltaTime * fovLerpSpeed);
     }
 }
