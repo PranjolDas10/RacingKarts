@@ -1,238 +1,226 @@
 using System.Collections;
-using System.Collections.Generic;
 using UnityEngine;
 using TMPro;
 
-
+/// <summary>
+/// Core vehicle physics controller. Handles drivetrain torque distribution,
+/// Ackermann-geometry steering, braking, and the nitro boost system.
+/// Publishes state to <see cref="RaceEventBus"/> each physics tick so that UI
+/// and audio systems react without polling or direct coupling.
+/// </summary>
 public class PlayerController : MonoBehaviour
 {
-    internal enum driveType
-    {
-        frontWheelDrive,
-        rearWheelDrive,
-        allWheelDrive
-    }
-    [SerializeField] private driveType drive;
+    internal enum DriveType { FrontWheelDrive, RearWheelDrive, AllWheelDrive }
+
+    // ── Inspector ─────────────────────────────────────────────────────────────
+
+    [Header("Drivetrain")]
+    [SerializeField] private DriveType drive = DriveType.AllWheelDrive;
+
+    [Header("Wheel References")]
+    public WheelCollider[] wheels    = new WheelCollider[4];
+    public GameObject[]    wheelMesh = new GameObject[4];
+
+    [Header("Engine")]
+    public float motorTorque = 400f;
+
+    [Header("Steering — Ackermann Geometry")]
+    [SerializeField] private float wheelBase   = 2.55f; // front–rear axle distance (m)
+    [SerializeField] private float rearTrack   = 1.5f;  // lateral rear-wheel separation (m)
+    [SerializeField] private float turnRadius  = 6f;
+
+    [Header("Braking")]
+    [SerializeField] private float brakeTorque          = 500f;
+    [SerializeField] private float idleBrakeTorque      = 10f;
+    [SerializeField] private float brakeSpeedThreshold  = 10f;  // KPH
+
+    [Header("Nitro")]
+    [Tooltip("Optional ScriptableObject preset — overrides the fields below when assigned.")]
+    [SerializeField] private KartStats stats;
+
+    public  float nitrusValue;
+    [HideInInspector] public bool nitrusFlag;
+
+    [SerializeField] private float nitroCapacity     = 10f;
+    [SerializeField] private float nitroRechargeRate = 0.5f;  // units / sec
+    [SerializeField] private float nitroDrainRate    = 1f;    // units / sec
+    [SerializeField] private float nitroBoostForce   = 5000f; // Newtons
+
+    [Header("Race")]
+    public bool   hasFinished;
+    public string carName;
+    public GameObject        finishPanel;
+    public TextMeshProUGUI   raceTimeText;
+    [SerializeField] private int totalLaps = 2;
+
+    // ── Runtime state ─────────────────────────────────────────────────────────
+
+    [HideInInspector] public float KPH;
 
     private InputManager IM;
-    private CarEffects CarEffects;
-    private Gamemanager GameMan;
+    private CarEffects   carEffects;
+    private Gamemanager  gameManager;
+    private Rigidbody    rb;
+    private float        brakePower;
+    private int          lapCount;
 
-    public WheelCollider[] wheels = new WheelCollider[4];
-    public GameObject[] wheelMesh = new GameObject[4];
-    public float motorTorque = 200;
-    public float steeringMax = 25;
-    private float radius = 6;
-    private float horizontal;
-    private float vertical;
-    [HideInInspector] public float KPH;
-    private float brakPower = 0;
-    private float totalPower;
-    private Rigidbody rigidbody;
+    // ── Unity messages ────────────────────────────────────────────────────────
 
-    /*[HideInInspector]*/
-    public float nitrusValue;
-    [HideInInspector] public bool nitrusFlag = false;
-
-    public bool hasFinished;
-    public string carName;
-
-    private int finishLineCounter = 0;
-    public GameObject finishPanel;
-    public TextMeshProUGUI raceTimeText;
-
-    //private float raceTime = 0f;
-    // Start is called before the first frame update
-    void Start()
+    private void Start()
     {
-        getObjects();
+        IM         = GetComponent<InputManager>();
+        rb         = GetComponent<Rigidbody>();
+        carEffects = GetComponent<CarEffects>();
+
+        GameObject gm = GameObject.Find("GameManager");
+        if (gm != null) gameManager = gm.GetComponent<Gamemanager>();
+        else Debug.LogError("GameManager not found in scene.");
+
+        ApplyKartStatsPreset();
     }
 
-    private void Update()
+    private void FixedUpdate()
     {
+        AnimateWheels();
+        ApplySteering();
+        ApplyDrive();
+        KPH = rb.velocity.magnitude * 3.6f;
+
+        if (gameObject.CompareTag("AI")) return;
+
+        ApplyNitro();
+        RaceEventBus.PublishSpeedChanged(KPH, 180f);
+        RaceEventBus.PublishNitroChanged(nitrusValue / nitroCapacity);
+
+        if (gameManager != null && gameManager.raceStarted)
+            gameManager.raceTime += Time.deltaTime;
     }
 
-    void FixedUpdate()
+    // ── Physics ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Ackermann steering geometry: the inner wheel follows a tighter arc than
+    /// the outer wheel, eliminating tyre scrub through corners.
+    /// </summary>
+    private void ApplySteering()
     {
-        animateWheels();
-        moveVehicle();
-        steerVehicle();
-        if (gameObject.tag == "AI") return;
-        activateNitrus();
-        if (GameMan.raceStarted == true)
+        float input = IM.horizontal;
+        if (Mathf.Approximately(input, 0f))
         {
-            GameMan.raceTime += Time.deltaTime;
+            wheels[0].steerAngle = 0f;
+            wheels[1].steerAngle = 0f;
+            return;
+        }
+
+        float inner = Mathf.Rad2Deg * Mathf.Atan(wheelBase / (turnRadius - rearTrack * 0.5f)) * input;
+        float outer = Mathf.Rad2Deg * Mathf.Atan(wheelBase / (turnRadius + rearTrack * 0.5f)) * input;
+
+        wheels[0].steerAngle = (input > 0f) ? inner : outer;
+        wheels[1].steerAngle = (input > 0f) ? outer : inner;
+    }
+
+    private void ApplyDrive()
+    {
+        ApplyBrakes();
+
+        float torque = IM.vertical * motorTorque;
+        switch (drive)
+        {
+            case DriveType.AllWheelDrive:
+                foreach (var w in wheels) w.motorTorque = torque * 0.25f;
+                break;
+            case DriveType.RearWheelDrive:
+                wheels[2].motorTorque = wheels[3].motorTorque = torque * 0.5f;
+                break;
+            default: // FrontWheelDrive
+                wheels[0].motorTorque = wheels[1].motorTorque = torque * 0.5f;
+                break;
         }
     }
 
-    private void steerVehicle()
+    private void ApplyBrakes()
     {
-        //steering
-        //acerman steering formula
-        //steerAngle = Mathf.Rad2Deg * Mathf.Atan(2.55f / (radius + (1.5f / 2))) * horizontalInput;
+        if (IM.vertical < 0f && KPH >= brakeSpeedThreshold)
+            brakePower = brakeTorque;
+        else if (Mathf.Approximately(IM.vertical, 0f))
+            brakePower = idleBrakeTorque;
+        else
+            brakePower = 0f;
 
-        if (IM.horizontal > 0)
-        {
-            //rear tracks size is set to 1.5f       wheel base has been set to 2.55f
-            wheels[0].steerAngle = Mathf.Rad2Deg * Mathf.Atan(2.55f / (radius + (1.5f / 2))) * IM.horizontal;
-            wheels[1].steerAngle = Mathf.Rad2Deg * Mathf.Atan(2.55f / (radius - (1.5f / 2))) * IM.horizontal;
-        }
-        else if (IM.horizontal < 0)
-        {
-            wheels[0].steerAngle = Mathf.Rad2Deg * Mathf.Atan(2.55f / (radius - (1.5f / 2))) * IM.horizontal;
-            wheels[1].steerAngle = Mathf.Rad2Deg * Mathf.Atan(2.55f / (radius + (1.5f / 2))) * IM.horizontal;
-            //transform.Rotate(Vector3.up * steerHelping);
+        foreach (var w in wheels) w.brakeTorque = brakePower;
+    }
 
+    public void ApplyNitro()
+    {
+        bool boosting = IM.boosting && nitrusValue > 0f;
+
+        if (boosting)
+        {
+            nitrusValue = Mathf.Max(0f, nitrusValue - nitroDrainRate * Time.deltaTime);
+            rb.AddForce(transform.forward * nitroBoostForce);
+            carEffects.startNitrusEmitter();
         }
         else
         {
-            wheels[0].steerAngle = 0;
-            wheels[1].steerAngle = 0;
+            carEffects.stopNitrusEmitter();
+            if (nitrusValue < nitroCapacity)
+                nitrusValue = Mathf.Min(nitroCapacity, nitrusValue + nitroRechargeRate * Time.deltaTime);
         }
     }
 
-    // Move the vehicle based on the input
-    private void moveVehicle()
+    private void AnimateWheels()
     {
-        // Movement logic goes here
-
-        brakeVehicle();
-
-        if (drive == driveType.allWheelDrive)
+        for (int i = 0; i < wheels.Length; i++)
         {
-            // All-wheel drive
-            for (int i = 0; i < wheels.Length; i++)
-            {
-                wheels[i].motorTorque = IM.vertical * (motorTorque / 4);
-            }
-        }
-        else if (drive == driveType.rearWheelDrive)
-        {
-            // Rear-wheel drive
-            for (int i = 2; i < wheels.Length; i++)
-            {
-                wheels[i].motorTorque = IM.vertical * (motorTorque / 2);
-            }
-        }
-        else
-        {
-            // Front-wheel drive
-            for (int i = 0; i < wheels.Length - 2; i++)
-            {
-                wheels[i].motorTorque = IM.vertical * (motorTorque / 2);
-            }
-        }
-
-        KPH = rigidbody.velocity.magnitude * 3.6f;
-    }
-
-    // Apply braking to the vehicle
-    private void brakeVehicle()
-    {
-        if (vertical < 0)
-        {
-            brakPower = (KPH >= 10) ? 500 : 0;
-        }
-        else if (vertical == 0 && (KPH <= 10 || KPH >= -10))
-        {
-            brakPower = 10;
-        }
-        else
-        {
-            brakPower = 0;
+            wheels[i].GetWorldPose(out Vector3 pos, out Quaternion rot);
+            wheelMesh[i].transform.SetPositionAndRotation(pos, rot);
         }
     }
 
-    // Animate the wheels to match the collider positions
-    void animateWheels()
-    {
-        Vector3 wheelPosition = Vector3.zero;
-        Quaternion wheelRotation = Quaternion.identity;
-        for (int i = 0; i < 4; i++)
-        {
-            wheels[i].GetWorldPose(out wheelPosition, out wheelRotation);
-            wheelMesh[i].transform.position = wheelPosition;
-            wheelMesh[i].transform.rotation = wheelRotation;
-        }
-    }
+    // ── Finish line ───────────────────────────────────────────────────────────
 
-    // Get references to the required objects
-    private void getObjects()
-    {
-        IM = GetComponent<InputManager>();
-        rigidbody = GetComponent<Rigidbody>();
-        CarEffects = GetComponent<CarEffects>();
-        GameMan = GetComponent<Gamemanager>();
-        GameObject gameManagerObject = GameObject.Find("GameManager");
-        if (gameManagerObject != null)
-        {
-            GameMan = gameManagerObject.GetComponent<Gamemanager>();
-        }
-        else
-        {
-            Debug.LogError("GameManager object not found!");
-        }
-    }
-
-    // Activate the nitrus boost
-    public void activateNitrus()
-    {
-        if (!IM.boosting && nitrusValue <= 10)
-        {
-            nitrusValue += Time.deltaTime / 2;
-        }
-        else
-        {
-            nitrusValue -= (nitrusValue <= 0) ? 0 : Time.deltaTime;
-        }
-
-        if (IM.boosting)
-        {
-            if (nitrusValue > 0)
-            {
-                CarEffects.startNitrusEmitter();
-                rigidbody.AddForce(transform.forward * 10000);
-            }
-            else
-            {
-                CarEffects.stopNitrusEmitter();
-            }
-        }
-        else
-        {
-            CarEffects.stopNitrusEmitter();
-        }
-    }
-
-    // Handle collision with the finish line
     private void OnTriggerEnter(Collider other)
     {
-        if (other.CompareTag("Finish") && GameMan.raceStarted && !gameObject.CompareTag("AI"))
-        {
-            finishLineCounter++;
+        if (!other.CompareTag("Finish") || gameManager == null || !gameManager.raceStarted)
+            return;
 
-            if (finishLineCounter == 2)
-            {
-                StopRace();
-            }
-        }
+        lapCount++;
+        RaceEventBus.PublishLapCompleted(lapCount, totalLaps);
+
+        if (lapCount >= totalLaps && !hasFinished)
+            StartCoroutine(FinishRace());
     }
 
-    // Stop the race and display the finish panel
-    private void StopRace()
+    private IEnumerator FinishRace()
     {
-        StartCoroutine(PauseGameAfterDelay(1f));
-    }
-
-    // Pause the game after a delay and activate the finish panel
-    private IEnumerator PauseGameAfterDelay(float delay)
-    {
-        yield return new WaitForSeconds(delay);
-
-        Time.timeScale = 0f;  // Pause the game
-
-        // Activate the finish panel
+        hasFinished = true;
+        RaceEventBus.PublishRaceFinished(carName, gameManager.raceTime);
+        yield return new WaitForSeconds(1f);
+        Time.timeScale = 0f;
         finishPanel.SetActive(true);
-        raceTimeText.text = "Race finished! Time: " + GameMan.raceTime.ToString("0.00") + " seconds";
+        raceTimeText.text = $"Race finished! Time: {gameManager.raceTime:0.00}s";
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// When a <see cref="KartStats"/> preset is assigned, its values replace the
+    /// individually serialized fields — allowing hot-swappable kart configurations.
+    /// </summary>
+    private void ApplyKartStatsPreset()
+    {
+        if (stats == null) return;
+
+        motorTorque       = stats.maxMotorTorque;
+        wheelBase         = stats.wheelBase;
+        rearTrack         = stats.rearTrack;
+        turnRadius        = stats.turnRadius;
+        brakeTorque       = stats.brakeTorque;
+        idleBrakeTorque   = stats.idleBrakeTorque;
+        brakeSpeedThreshold = stats.brakeSpeedThreshold;
+        nitroCapacity     = stats.nitroCapacity;
+        nitroRechargeRate = stats.nitroRechargeRate;
+        nitroDrainRate    = stats.nitroDrainRate;
+        nitroBoostForce   = stats.nitroBoostForce;
     }
 }
